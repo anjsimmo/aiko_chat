@@ -25,7 +25,6 @@
 # - Implement "ChatServer.topic_out" Dependency link ...
 #   - "ChatServer.topic_out" --[function_call]--> "ChatREPL.topic_in"
 #
-# - Add send_message() properties: timestamp, username
 # - UI: CLI (REPL), TUI (Dashboard plug-in), Web
 #   - Implement "/commands", e.g "/help"
 #   - Refactor standard tty REPL ("scheme_tty.py")
@@ -36,7 +35,10 @@
 
 from abc import abstractmethod
 import click
+import getpass
+import json
 import signal
+import time
 from typing import Iterable, List
 
 import aiko_services as aiko
@@ -46,6 +48,7 @@ __all__ = ["ChatREPL", "ChatREPLImpl", "ChatServer", "ChatServerImpl"]
 
 _CHANNEL_NAME = "general"  # TODO: Support multiple channels (CRUD)
 _HISTORY_PATHNAME = None
+_USERNAME = getpass.getuser()  # Default sender identity; override via "repl USERNAME"
 _VERSION = 0
 
 _ACTOR_REPL = "chat_repl"
@@ -69,6 +72,34 @@ def parse_recipients(recipients: str | None) -> List[str]:
     if not recipients:
         return []
     return list(filter(None, map(str.strip, recipients.split(","))))
+
+def generate_payload(
+        recipients: str, message: str,
+        username: str | None = None, timestamp: float | None = None) -> str:
+    # Backwards compatible: without a username, keep the original bare-string
+    # form ("recipients: message") so existing clients are unaffected. With a
+    # username, emit a structured JSON payload carrying sender identity and a
+    # timestamp, which lets consumers (UIs, bridges) attribute each message.
+    if username is None:
+        return f"{recipients}: {message}"
+    return json.dumps({
+        "recipients": recipients,
+        "username": username,
+        "timestamp": timestamp if timestamp is not None else time.time(),
+        "message": message,
+    })
+
+def format_incoming(payload_in: str) -> str:
+    # Render a structured payload as "username: message"; pass the legacy
+    # bare-string form through unchanged.
+    try:
+        data = json.loads(payload_in)
+    except (TypeError, ValueError):
+        return payload_in
+    if isinstance(data, dict) and "message" in data:
+        prefix = data.get("username") or data.get("recipients", "")
+        return f"{prefix}: {data['message']}" if prefix else data["message"]
+    return payload_in
 
 # --------------------------------------------------------------------------- #
 # Aiko ChatREPL: Interface and Implementation
@@ -106,7 +137,8 @@ class ChatREPLImpl(aiko.Actor):
         else:
             if self.chat_server:
                 recipients = [_CHANNEL_NAME]
-                self.chat_server.send_message(recipients, command)
+                self.chat_server.send_message(
+                    recipients, command, username=_USERNAME)
 
     def discovery_add_handler(self, service_details, service):
         self.print(f"Connected    {service_details[1]}: {service_details[0]}")
@@ -122,7 +154,7 @@ class ChatREPLImpl(aiko.Actor):
         self.repl_session.join()  # wait until background thread has cleaned-up
 
     def server_message_handler(self, _aiko, topic, payload_in):
-        self.print(payload_in)
+        self.print(format_incoming(payload_in))
 
     def on_sigint(self, signum, frame):
         self.repl_session.stop()
@@ -145,7 +177,7 @@ class ChatServer(aiko.Actor):
         pass
 
     @abstractmethod
-    def send_message(self, recipients, message):
+    def send_message(self, recipients, message, username=None, timestamp=None):
         pass
 
 class ChatServerImpl(aiko.Actor):
@@ -156,9 +188,9 @@ class ChatServerImpl(aiko.Actor):
     def exit(self):
         aiko.process.terminate()
 
-    def send_message(self, recipients, message):
+    def send_message(self, recipients, message, username=None, timestamp=None):
         recipients = generate_recipients(recipients)
-        payload_out = f"{recipients}: {message}"
+        payload_out = generate_payload(recipients, message, username, timestamp)
         self.logger.info(f"send_message({payload_out})")
         aiko.process.message.publish(self.topic_out, payload_out)
 
@@ -178,12 +210,16 @@ def exit_command():
     aiko.process.run()
 
 @main.command(name="repl")
-def repl_command():
+@click.argument("username", type=str, required=False, default=None)
+def repl_command(username):
     """Run Chat CLI REPL frontend
 
-    ./chat.py repl
+    ./chat.py repl [USERNAME]
     """
 
+    global _USERNAME
+    if username:
+        _USERNAME = username
     tags = ["ec=true"]       # TODO: Add ECProducer tag before add to Registrar
     init_args = aiko.actor_args(_ACTOR_REPL, protocol=_PROTOCOL_REPL, tags=tags)
     chat = aiko.compose_instance(ChatREPLImpl, init_args)
@@ -207,20 +243,24 @@ def run_command():
 @main.command(name="send")
 @click.argument("recipients", type=str, required=True, default=None)
 @click.argument("message", type=str, required=True, default=None)
+@click.option("--username", type=str, default=None,
+    help="Sender identity to attach to the message")
 
-def send_command(recipients, message):
+def send_command(recipients, message, username):
     """Send message to recipients (channels and/or users)
 
-    ./chat.py send RECIPIENTS MESSAGE
+    ./chat.py send RECIPIENTS MESSAGE [--username USERNAME]
 
     \b
     • RECIPIENTS: List of one or more (comma separated) channels or @usernames
     • MESSAGE:    Data to be sent to the recipients
+    • --username: Optional sender identity (structured payload when set)
     """
 
     recipient_list = parse_recipients(recipients)
     aiko.do_command(ChatServer, get_server_service_filter(),
-        lambda chat: chat.send_message(recipient_list, message), terminate=True)
+        lambda chat: chat.send_message(recipient_list, message, username=username),
+        terminate=True)
     aiko.process.run()
 
 if __name__ == "__main__":
